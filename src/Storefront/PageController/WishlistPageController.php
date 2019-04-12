@@ -7,28 +7,47 @@ use Shopware\Core\Checkout\Cart\Exception\InvalidPayloadException;
 use Shopware\Core\Checkout\Cart\Exception\InvalidQuantityException;
 use Shopware\Core\Checkout\Cart\Exception\MixedLineItemTypeException;
 use Shopware\Core\Framework\DataAbstractionLayer\Exception\InconsistentCriteriaIdsException;
+use Shopware\Core\Framework\Routing\Exception\MissingRequestParameterException;
 use Shopware\Core\Framework\Routing\InternalRequest;
 use Shopware\Core\System\SalesChannel\SalesChannelContext;
 use Shopware\Storefront\Framework\Controller\StorefrontController;
+use Shopware\Storefront\Framework\Page\PageLoaderInterface;
+use Shopware\Storefront\Page\Listing\ListingPageLoader;
+use Symfony\Component\HttpFoundation\File\Exception\AccessDeniedException;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Routing\Annotation\Route;
 use Workshop\Plugin\WorkshopWishlist\Core\Wishlist\Storefront\WishlistService;
-use Workshop\Plugin\WorkshopWishlist\Entity\Wishlist\WishlistEntity;
 use Workshop\Plugin\WorkshopWishlist\Exception\Wishlist\WishlistNotFoundException;
+use Workshop\Plugin\WorkshopWishlist\Storefront\Page\Wishlist\WishlistPageLoader;
 
 class WishlistPageController extends StorefrontController
 {
+    /**
+     * @var WishlistPageLoader|PageLoaderInterface
+     */
+    private $wishlistPageLoader;
+
+    /**
+     * @var ListingPageLoader|PageLoaderInterface
+     */
+    private $listingPageLoader;
+
     /**
      * @var WishlistService
      */
     private $wishlistService;
 
-    public function __construct(WishlistService $wishlistService)
-    {
-        $this->wishlistService = $wishlistService;
+    public function __construct(
+        PageLoaderInterface $listingPageLoader,
+        PageLoaderInterface $wishlistPageLoader,
+        WishlistService $wishlistService
+    ) {
+        $this->listingPageLoader  = $listingPageLoader;
+        $this->wishlistPageLoader = $wishlistPageLoader;
+        $this->wishlistService    = $wishlistService;
     }
 
     /**
@@ -64,34 +83,25 @@ class WishlistPageController extends StorefrontController
      * )
      *
      * @param SalesChannelContext $context
-     * @param string              $wishlistId
+     * @param InternalRequest     $request
      *
      * @return Response
      *
      * @throws InconsistentCriteriaIdsException
+     * @throws MissingRequestParameterException
      */
-    public function item(SalesChannelContext $context, string $wishlistId): Response
+    public function item(SalesChannelContext $context, InternalRequest $request): Response
     {
-        /** @var WishlistEntity $wishlist */
-        $wishlist        = $this->wishlistService->getWishlistById($wishlistId, $context->getContext());
-
-        if (!$wishlist) {
+        try {
+            $page = $this->wishlistPageLoader->load($request, $context);
+        } catch (WishlistNotFoundException $e) {
             return $this->redirectToRoute('frontend.wishlist.index');
-        }
-
-        $customerId      = $context->getCustomer()->getId();
-        $isPublic        = ! $wishlist->isPrivate();
-        $customerIsOwner = $customerId === $wishlist->getCustomer()->getId();
-        $accessDenied    = ! ($isPublic || $customerIsOwner);
-
-        if ($accessDenied) {
+        } catch (AccessDeniedException $e) {
             return $this->redirectToRoute('frontend.wishlist.index');
         }
 
         return $this->renderStorefront('@WorkshopWishlist/page/wishlist/item.html.twig', [
-            'wishlist'        => $wishlist,
-            'customerIsOwner' => $customerIsOwner,
-            'loggedIn' => (!empty($context->getCustomer())),
+            'page' => $page
         ]);
     }
 
@@ -103,21 +113,20 @@ class WishlistPageController extends StorefrontController
      * )
      *
      * @param SalesChannelContext $context
+     * @param InternalRequest     $request
      *
      * @return Response
-     *
-     * @throws InconsistentCriteriaIdsException
      */
-    public function index(SalesChannelContext $context): Response
+    public function index(SalesChannelContext $context, InternalRequest $request): Response
     {
         if (!$context->getCustomer()) {
             return $this->redirectToRoute('frontend.account.login.page');
         }
 
-        $result = $this->wishlistService->getWishlistsForUser($context->getCustomer(), $context->getContext());
+        $page = $this->listingPageLoader->load($request, $context);
 
         return $this->renderStorefront('@WorkshopWishlist/page/wishlist/index.html.twig', [
-            'wishlists' => $result,
+            'page' => $page,
         ]);
     }
 
@@ -255,4 +264,66 @@ class WishlistPageController extends StorefrontController
 
         return $this->redirectToRoute('frontend.checkout.cart.page');
     }
+    /**
+     * @Route("/wishlist/remove/{wishlistId}", name="frontend.wishlist.remove", methods={"POST"})
+     *
+     * @param string $wishlistId
+     * @param Request $request
+     * @param SalesChannelContext $context
+     * @return RedirectResponse
+     * @throws InconsistentCriteriaIdsException
+     * @throws WishlistNotFoundException
+     */
+    public function removeWishlist(string $wishlistId, Request $request, SalesChannelContext $context): RedirectResponse
+    {
+        $customer = $context->getCustomer();
+        if (!$customer) {
+            return $this->redirectToRoute('frontend.account.login.page');
+        }
+
+        $wishlist = $this->wishlistService->getWishlistById($wishlistId, $context->getContext());
+        if (!$wishlist) {
+            throw new WishlistNotFoundException($wishlistId);
+        }
+
+        if ($this->wishlistService->checkAccessToWishlist($wishlist, $customer)) {
+            $this->wishlistService->removeWishlist($wishlist,  $context->getContext());
+        }
+
+        return $this->redirectToRoute('frontend.wishlist.index');
+    }
+
+    /**
+     * @Route("/wishlist/{wishlistId}/product/{productId}", name="frontend.wishlist.product.remove", methods={"POST"})
+     *
+     * @param string $wishlistId
+     * @param string $productId
+     * @param Request $request
+     * @param SalesChannelContext $context
+     * @return JsonResponse
+     * @throws InconsistentCriteriaIdsException
+     * @throws WishlistNotFoundException
+     */
+    public function removeProductFromWishlist(string $wishlistId, string $productId, Request $request, SalesChannelContext $context): RedirectResponse
+    {
+        $customer = $context->getCustomer();
+        if (!$customer) {
+            return $this->redirectToRoute('frontend.account.login.page');
+        }
+
+        $wishlist = $this->wishlistService->getWishlistById($wishlistId, $context->getContext());
+        if (!$wishlist) {
+            throw new WishlistNotFoundException($wishlistId);
+        }
+
+        if (!$this->wishlistService->checkAccessToWishlist($wishlist, $customer)) {
+            return $this->redirectToRoute('frontend.wishlist.index');
+        }
+
+        $this->wishlistService->removeProduct($wishlist, $productId,  $context->getContext());
+
+        return $this->redirectToRoute('frontend.wishlist.item', ['wishlistId' => $wishlistId]);
+    }
+
+
 }
